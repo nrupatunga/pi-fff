@@ -286,10 +286,33 @@ export default function fffExtension(pi: ExtensionAPI) {
 		}));
 	}
 
-	function applyEditorMode(ctx: { ui: { setEditorComponent: (factory: any) => void } }) {
+	let warnedAboutEditorConflict = false;
+
+	function hasKnownEditorConflict(): boolean {
+		return (
+			existsSync(join(getAgentDir(), "extensions", "modes.ts")) ||
+			existsSync(join(getAgentDir(), "extensions", "modes", "index.ts")) ||
+			existsSync(join(activeCwd, ".pi", "extensions", "modes.ts")) ||
+			existsSync(join(activeCwd, ".pi", "extensions", "modes", "index.ts"))
+		);
+	}
+
+	function applyEditorMode(ctx: { ui: { setEditorComponent: (factory: any) => void; notify?: (message: string, level: string) => void } }) {
 		const mode = getMode();
 		if (mode === "tools-only") {
-			ctx.ui.setEditorComponent(undefined);
+			// Important: do not clear another extension's custom editor.
+			// tools-only means FFF should stay out of the editor entirely.
+			return;
+		}
+
+		if (hasKnownEditorConflict()) {
+			if (!warnedAboutEditorConflict) {
+				warnedAboutEditorConflict = true;
+				ctx.ui.notify?.(
+					'FFF editor autocomplete disabled because a modes editor is installed. FFF search tools remain active. Use /fff-mode tools-only to silence this warning.',
+					'info',
+				);
+			}
 			return;
 		}
 
