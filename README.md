@@ -9,6 +9,7 @@ A [pi](https://github.com/badlogic/pi-mono) extension that replaces the built-in
 | `find` (spawns `fd`) | `find` (FFF `fileSearch`) | Fuzzy matching, frecency ranking, git-aware, pre-indexed |
 | `grep` (spawns `rg`) | `grep` (FFF `grep`) | SIMD-accelerated, frecency-ordered, mmap-cached, no subprocess |
 | *(none)* | `multi_grep` (FFF `multiGrep`) | OR-logic multi-pattern search via Aho-Corasick |
+| `@` file autocomplete (fd-backed) | `@` file autocomplete (FFF-backed, default) | Fuzzy ranking from FFF index/frecency |
 
 ### Key advantages over built-in tools
 
@@ -47,7 +48,7 @@ This is the recommended installation method. pi will clone the repo, install dep
 If you want a fixed version instead of tracking the default branch:
 
 ```bash
-pi install git:github.com/SamuelLHuber/pi-fff@v0.1.0
+pi install git:github.com/SamuelLHuber/pi-fff@v0.2.0
 ```
 
 ### Local development / manual install
@@ -113,6 +114,18 @@ Parameters:
 
 - `/fff-health` — show FFF status (indexed files, git info, frecency/history DB status)
 - `/fff-rescan` — trigger a file rescan
+- `/fff-mode both|tools-only` — switch mode and persist it
+
+## Modes
+
+- `both` (default): tool overrides + `@` autocomplete replacement in UI
+- `tools-only`: only tool overrides; keep pi's default fd-backed `@` autocomplete
+
+Mode precedence:
+1. `--fff-mode <mode>` CLI flag
+2. `PI_FFF_MODE=<mode>` environment variable
+3. persisted config (`~/.pi/agent/fff/config.json`)
+4. default (`both`)
 
 ## Data
 

@@ -1,30 +1,24 @@
 /**
  * pi-fff: FFF-powered file search extension for pi
  *
- * Overrides the built-in `find` and `grep` tools with FFF (Fast File Finder),
- * a Rust-native fuzzy file finder with frecency ranking, git awareness,
- * and SIMD-accelerated content search.
- *
- * Also adds a `multi_grep` tool for OR-logic multi-pattern search.
- *
- * Usage:
- *   Add to settings.json extensions or ~/.pi/agent/extensions/
- *   Or test with: pi -e /path/to/pi-fff/src/index.ts
+ * Overrides built-in `find` and `grep` tools with FFF and can also replace
+ * @-mention autocomplete suggestions in the interactive editor.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { getAgentDir, truncateHead, DEFAULT_MAX_BYTES, formatSize } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import {
+	CustomEditor,
+	getAgentDir,
+	truncateHead,
+	DEFAULT_MAX_BYTES,
+	formatSize,
+} from "@mariozechner/pi-coding-agent";
+import { Text, type AutocompleteItem, type AutocompleteProvider, type AutocompleteSuggestions } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { FileFinder } from "@ff-labs/fff-node";
-import type {
-	GrepCursor,
-	GrepResult,
-	SearchResult,
-	GrepMode,
-} from "@ff-labs/fff-node";
+import type { GrepCursor, GrepMode, GrepResult, SearchResult } from "@ff-labs/fff-node";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
-import { mkdirSync } from "fs";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -33,9 +27,14 @@ import { mkdirSync } from "fs";
 const FFF_DB_DIR = join(getAgentDir(), "fff");
 const FRECENCY_DB_PATH = join(FFF_DB_DIR, "frecency.mdb");
 const HISTORY_DB_PATH = join(FFF_DB_DIR, "history.mdb");
+const CONFIG_PATH = join(FFF_DB_DIR, "config.json");
+
 const DEFAULT_GREP_LIMIT = 100;
 const DEFAULT_FIND_LIMIT = 200;
 const GREP_MAX_LINE_LENGTH = 500;
+const MENTION_MAX_RESULTS = 20;
+
+type FffMode = "both" | "tools-only";
 
 // ---------------------------------------------------------------------------
 // Cursor store — maps opaque IDs to GrepCursor values across tool calls
@@ -48,7 +47,6 @@ class CursorStore {
 	store(cursor: GrepCursor): string {
 		const id = `fff_c${++this.counter}`;
 		this.cursors.set(id, cursor);
-		// Evict old entries to bound memory
 		if (this.cursors.size > 200) {
 			const first = this.cursors.keys().next().value;
 			if (first) this.cursors.delete(first);
@@ -81,11 +79,9 @@ function formatGrepOutput(result: GrepResult, limit: number): string {
 	for (const match of items) {
 		if (match.relativePath !== currentFile) {
 			currentFile = match.relativePath;
-			// Blank line between files for readability
 			if (lines.length > 0) lines.push("");
 		}
 
-		// Context before
 		if (match.contextBefore && match.contextBefore.length > 0) {
 			const startLine = match.lineNumber - match.contextBefore.length;
 			for (let i = 0; i < match.contextBefore.length; i++) {
@@ -93,10 +89,8 @@ function formatGrepOutput(result: GrepResult, limit: number): string {
 			}
 		}
 
-		// Match line
 		lines.push(`${match.relativePath}:${match.lineNumber}: ${truncateLine(match.lineContent)}`);
 
-		// Context after
 		if (match.contextAfter && match.contextAfter.length > 0) {
 			const startLine = match.lineNumber + 1;
 			for (let i = 0; i < match.contextAfter.length; i++) {
@@ -115,6 +109,83 @@ function formatFindOutput(result: SearchResult, limit: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Mention autocomplete replacement helpers
+// ---------------------------------------------------------------------------
+
+function extractAtPrefix(textBeforeCursor: string): string | null {
+	const match = textBeforeCursor.match(/(?:^|[ \t])(@(?:"[^"]*|[^\s]*))$/);
+	return match?.[1] ?? null;
+}
+
+function parseAtPrefix(prefix: string): { raw: string; quoted: boolean } {
+	if (prefix.startsWith('@"')) {
+		return { raw: prefix.slice(2), quoted: true };
+	}
+	return { raw: prefix.slice(1), quoted: false };
+}
+
+function buildAtCompletionValue(path: string, quotedPrefix: boolean): string {
+	if (quotedPrefix || path.includes(" ")) {
+		return `@"${path}"`;
+	}
+	return `@${path}`;
+}
+
+class FffAtMentionProvider implements AutocompleteProvider {
+	constructor(
+		private base: AutocompleteProvider,
+		private getItems: (query: string, quotedPrefix: boolean, signal: AbortSignal) => Promise<AutocompleteItem[]>,
+	) {}
+
+	async getSuggestions(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		options: { signal: AbortSignal; force?: boolean },
+	): Promise<AutocompleteSuggestions | null> {
+		const currentLine = lines[cursorLine] || "";
+		const textBeforeCursor = currentLine.slice(0, cursorCol);
+		const atPrefix = extractAtPrefix(textBeforeCursor);
+
+		if (!atPrefix) {
+			return this.base.getSuggestions(lines, cursorLine, cursorCol, options);
+		}
+
+		const { raw, quoted } = parseAtPrefix(atPrefix);
+		if (options.signal.aborted) return null;
+
+		try {
+			const items = await this.getItems(raw, quoted, options.signal);
+			if (options.signal.aborted) return null;
+			if (items.length === 0) return null;
+			return { items, prefix: atPrefix };
+		} catch {
+			// If FFF lookup fails unexpectedly, fall back to built-in provider.
+			return this.base.getSuggestions(lines, cursorLine, cursorCol, options);
+		}
+	}
+
+	applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: AutocompleteItem, prefix: string) {
+		return this.base.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+	}
+}
+
+class FffEditor extends CustomEditor {
+	constructor(
+		tui: any,
+		theme: any,
+		keybindings: any,
+		private createProvider: (base: AutocompleteProvider) => AutocompleteProvider,
+	) {
+		super(tui, theme, keybindings);
+	}
+
+	override setAutocompleteProvider(provider: AutocompleteProvider): void {
+		super.setAutocompleteProvider(this.createProvider(provider));
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -122,11 +193,43 @@ export default function fffExtension(pi: ExtensionAPI) {
 	let finder: FileFinder | null = null;
 	const cursorStore = new CursorStore();
 
-	// Ensure DB directory exists
 	try {
 		mkdirSync(FFF_DB_DIR, { recursive: true });
 	} catch {
 		// ignore
+	}
+
+	function normalizeMode(value: string | undefined): FffMode {
+		return value === "tools-only" ? "tools-only" : "both";
+	}
+
+	function readConfigMode(): FffMode {
+		try {
+			if (!existsSync(CONFIG_PATH)) return "both";
+			const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as { mode?: string };
+			return normalizeMode(parsed.mode);
+		} catch {
+			return "both";
+		}
+	}
+
+	function writeConfigMode(mode: FffMode): void {
+		try {
+			writeFileSync(CONFIG_PATH, JSON.stringify({ mode }, null, 2), "utf8");
+		} catch {
+			// ignore
+		}
+	}
+
+	function getMode(): FffMode {
+		const flag = pi.getFlag("fff-mode");
+		if (typeof flag === "string" && flag.length > 0) {
+			return normalizeMode(flag);
+		}
+		if (process.env.PI_FFF_MODE) {
+			return normalizeMode(process.env.PI_FFF_MODE);
+		}
+		return readConfigMode();
 	}
 
 	async function ensureFinder(cwd: string): Promise<FileFinder> {
@@ -146,7 +249,7 @@ export default function fffExtension(pi: ExtensionAPI) {
 		finder = result.value;
 		const scanResult = await finder.waitForScan(15000);
 		if (scanResult.ok && !scanResult.value) {
-			// Timed out but still usable — partial index
+			// timed out but finder is still usable with partial index
 		}
 
 		return finder;
@@ -159,13 +262,49 @@ export default function fffExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	// --- Lifecycle ---
+	async function getMentionItems(query: string, quotedPrefix: boolean, signal: AbortSignal): Promise<AutocompleteItem[]> {
+		if (signal.aborted) return [];
+		const f = await ensureFinder(process.cwd());
+		if (signal.aborted) return [];
+
+		const searchResult = f.fileSearch(query, { pageSize: MENTION_MAX_RESULTS });
+		if (!searchResult.ok) return [];
+
+		return searchResult.value.items.slice(0, MENTION_MAX_RESULTS).map((item) => ({
+			value: buildAtCompletionValue(item.relativePath, quotedPrefix),
+			label: item.fileName,
+			description: item.relativePath,
+		}));
+	}
+
+	function applyEditorMode(ctx: { ui: { setEditorComponent: (factory: any) => void; setStatus: (k: string, t: string | undefined) => void } }) {
+		const mode = getMode();
+		if (mode === "tools-only") {
+			ctx.ui.setEditorComponent(undefined);
+			ctx.ui.setStatus("fff", "FFF tools-only (fd @ autocomplete)");
+			return;
+		}
+
+		ctx.ui.setEditorComponent((tui: any, theme: any, keybindings: any) =>
+			new FffEditor(tui, theme, keybindings, (baseProvider) =>
+				new FffAtMentionProvider(baseProvider, getMentionItems),
+			),
+		);
+		ctx.ui.setStatus("fff", "FFF enabled (@ autocomplete + tools)");
+	}
+
+	// --- Flags / lifecycle ---
+
+	pi.registerFlag("fff-mode", {
+		description: "FFF mode: both (default) or tools-only",
+		type: "string",
+		default: "both",
+	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 			await ensureFinder(ctx.cwd);
-			ctx.ui.setStatus("fff", "FFF indexed");
-			// Clear status after a moment
+			applyEditorMode(ctx);
 			setTimeout(() => ctx.ui.setStatus("fff", undefined), 3000);
 		} catch (e: unknown) {
 			const msg = e instanceof Error ? e.message : String(e);
@@ -173,7 +312,8 @@ export default function fffExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		ctx.ui.setEditorComponent(undefined);
 		destroyFinder();
 	});
 
@@ -221,20 +361,17 @@ export default function fffExtension(pi: ExtensionAPI) {
 			const f = await ensureFinder(process.cwd());
 			const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_GREP_LIMIT);
 
-			// Build query: prepend path constraint if provided
 			let query = params.pattern;
 			if (params.path) {
 				query = `${params.path} ${query}`;
 			}
 
-			// Determine mode
 			const isLiteral = params.literal !== false;
 			let mode: GrepMode = "plain";
 			if (!isLiteral) {
 				mode = "regex";
 			}
 
-			// Resolve cursor
 			const prevCursor = params.cursor ? cursorStore.get(params.cursor) : undefined;
 
 			const grepResult = f.grep(query, {
@@ -253,11 +390,9 @@ export default function fffExtension(pi: ExtensionAPI) {
 			const result = grepResult.value;
 			let output = formatGrepOutput(result, effectiveLimit);
 
-			// Apply byte truncation
 			const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
 			output = truncation.content;
 
-			// Build notices
 			const notices: string[] = [];
 			if (result.items.length >= effectiveLimit) {
 				notices.push(`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more`);
@@ -268,8 +403,6 @@ export default function fffExtension(pi: ExtensionAPI) {
 			if (result.regexFallbackError) {
 				notices.push(`Regex failed: ${result.regexFallbackError}, used literal match`);
 			}
-
-			// Pagination cursor
 			if (result.nextCursor) {
 				const cursorId = cursorStore.store(result.nextCursor);
 				notices.push(`More results available. Use cursor="${cursorId}" to continue`);
@@ -364,7 +497,6 @@ export default function fffExtension(pi: ExtensionAPI) {
 			const f = await ensureFinder(process.cwd());
 			const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_FIND_LIMIT);
 
-			// Build query: prepend path constraint if provided
 			let query = params.pattern;
 			if (params.path) {
 				query = `${params.path} ${query}`;
@@ -381,11 +513,9 @@ export default function fffExtension(pi: ExtensionAPI) {
 			const result = searchResult.value;
 			let output = formatFindOutput(result, effectiveLimit);
 
-			// Apply byte truncation
 			const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
 			output = truncation.content;
 
-			// Build notices
 			const notices: string[] = [];
 			if (result.items.length >= effectiveLimit) {
 				notices.push(
@@ -452,7 +582,7 @@ export default function fffExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// --- multi_grep tool (new, no built-in equivalent) ---
+	// --- multi_grep tool ---
 
 	const multiGrepSchema = Type.Object({
 		patterns: Type.Array(Type.String(), {
@@ -482,8 +612,7 @@ export default function fffExtension(pi: ExtensionAPI) {
 			`Patterns are literal text -- never escape special characters.`,
 			`Use the constraints parameter for file filtering ('*.rs', 'src/', '!test/').`,
 		].join(" "),
-		promptSnippet:
-			"Multi-pattern OR search across file contents (FFF: SIMD-accelerated, frecency-ranked)",
+		promptSnippet: "Multi-pattern OR search across file contents (FFF: SIMD-accelerated, frecency-ranked)",
 		promptGuidelines: [
 			"Use multi_grep when you need to find multiple identifiers at once (OR logic).",
 			"Include all naming conventions: snake_case, PascalCase, camelCase variants.",
@@ -494,15 +623,12 @@ export default function fffExtension(pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal) {
 			if (signal?.aborted) throw new Error("Operation aborted");
-
 			if (!params.patterns || params.patterns.length === 0) {
 				throw new Error("patterns array must have at least 1 element");
 			}
 
 			const f = await ensureFinder(process.cwd());
 			const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_GREP_LIMIT);
-
-			// Resolve cursor
 			const prevCursor = params.cursor ? cursorStore.get(params.cursor) : undefined;
 
 			const grepResult = f.multiGrep({
@@ -521,12 +647,9 @@ export default function fffExtension(pi: ExtensionAPI) {
 
 			const result = grepResult.value;
 			let output = formatGrepOutput(result, effectiveLimit);
-
-			// Apply byte truncation
 			const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
 			output = truncation.content;
 
-			// Build notices
 			const notices: string[] = [];
 			if (result.items.length >= effectiveLimit) {
 				notices.push(`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more`);
@@ -593,7 +716,17 @@ export default function fffExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// --- /fff-health command ---
+	// --- commands ---
+
+	pi.registerCommand("fff-mode", {
+		description: "Set FFF mode: /fff-mode both | tools-only",
+		handler: async (args, ctx) => {
+			const next = normalizeMode((args || "").trim() || "both");
+			writeConfigMode(next);
+			applyEditorMode(ctx);
+			ctx.ui.notify(`FFF mode set to '${next}'`, "info");
+		},
+	});
 
 	pi.registerCommand("fff-health", {
 		description: "Show FFF file finder health and status",
@@ -612,6 +745,7 @@ export default function fffExtension(pi: ExtensionAPI) {
 			const h = health.value;
 			const lines = [
 				`FFF v${h.version}`,
+				`Mode: ${getMode()}`,
 				`Git: ${h.git.repositoryFound ? `yes (${h.git.workdir ?? "unknown"})` : "no"}`,
 				`Picker: ${h.filePicker.initialized ? `${h.filePicker.indexedFiles ?? 0} files` : "not initialized"}`,
 				`Frecency: ${h.frecency.initialized ? "active" : "disabled"}`,
@@ -626,8 +760,6 @@ export default function fffExtension(pi: ExtensionAPI) {
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
-
-	// --- /fff-rescan command ---
 
 	pi.registerCommand("fff-rescan", {
 		description: "Trigger FFF to rescan files",
