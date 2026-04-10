@@ -294,9 +294,8 @@ export default function fffExtension(pi: ExtensionAPI) {
 	// --- Flags / lifecycle ---
 
 	pi.registerFlag("fff-mode", {
-		description: "FFF mode: both (default) or tools-only",
+		description: "FFF mode: both or tools-only (overrides config/env when provided)",
 		type: "string",
-		default: "both",
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -718,10 +717,14 @@ export default function fffExtension(pi: ExtensionAPI) {
 	pi.registerCommand("fff-mode", {
 		description: "Set FFF mode: /fff-mode both | tools-only",
 		handler: async (args, ctx) => {
-			const next = normalizeMode((args || "").trim() || "both");
-			writeConfigMode(next);
+			const raw = (args || "").trim();
+			if (raw !== "both" && raw !== "tools-only") {
+				ctx.ui.notify("Usage: /fff-mode both | tools-only", "warning");
+				return;
+			}
+			writeConfigMode(raw);
 			applyEditorMode(ctx);
-			ctx.ui.notify(`FFF mode set to '${next}'`, "info");
+			ctx.ui.notify(`FFF mode set to '${raw}'`, "info");
 		},
 	});
 
