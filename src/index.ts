@@ -36,6 +36,21 @@ const MENTION_MAX_RESULTS = 20;
 
 type FffMode = "both" | "tools-only";
 
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type ModeSpec = {
+	provider?: string;
+	modelId?: string;
+	thinkingLevel?: ThinkingLevel;
+};
+type ModesFile = {
+	version: 1;
+	currentMode: string;
+	modes: Record<string, ModeSpec>;
+};
+
+const CUSTOM_MODE_NAME = "custom";
+const ALL_THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
 // ---------------------------------------------------------------------------
 // Cursor store — maps opaque IDs to GrepCursor values across tool calls
 // ---------------------------------------------------------------------------
@@ -176,12 +191,40 @@ class FffEditor extends CustomEditor {
 		theme: any,
 		keybindings: any,
 		private createProvider: (base: AutocompleteProvider) => AutocompleteProvider,
+		private getModeLabel?: () => string,
 	) {
 		super(tui, theme, keybindings);
 	}
 
 	override setAutocompleteProvider(provider: AutocompleteProvider): void {
 		super.setAutocompleteProvider(this.createProvider(provider));
+	}
+
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		const mode = this.getModeLabel?.() ?? "";
+		if (!mode) return lines;
+
+		const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+		const topPlain = stripAnsi(lines[0] ?? "");
+		const scrollPrefixMatch = topPlain.match(/^(─── ↑ \d+ more )/);
+		const prefix = scrollPrefixMatch?.[1] ?? "──";
+
+		let label = mode;
+		const labelLeftSpace = prefix.endsWith(" ") ? "" : " ";
+		const labelRightSpace = " ";
+		const minRightBorder = 1;
+		const maxLabelLen = Math.max(0, width - prefix.length - labelLeftSpace.length - labelRightSpace.length - minRightBorder);
+		if (maxLabelLen <= 0) return lines;
+		if (label.length > maxLabelLen) label = label.slice(0, maxLabelLen);
+
+		const labelChunk = `${labelLeftSpace}${label}${labelRightSpace}`;
+		const remaining = width - prefix.length - labelChunk.length;
+		if (remaining < 0) return lines;
+
+		const right = "─".repeat(Math.max(0, remaining));
+		lines[0] = this.borderColor(prefix) + this.borderColor(labelChunk) + this.borderColor(right);
+		return lines;
 	}
 }
 
@@ -232,6 +275,95 @@ export default function fffExtension(pi: ExtensionAPI) {
 			return normalizeMode(process.env.PI_FFF_MODE);
 		}
 		return readConfigMode();
+	}
+
+	function getGlobalModesPath(): string {
+		return join(getAgentDir(), "modes.json");
+	}
+
+	function getProjectModesPath(cwd: string): string {
+		return join(cwd, ".pi", "modes.json");
+	}
+
+	function normalizeThinkingLevel(level: unknown): ThinkingLevel | undefined {
+		if (typeof level !== "string") return undefined;
+		return ALL_THINKING_LEVELS.includes(level as ThinkingLevel) ? (level as ThinkingLevel) : undefined;
+	}
+
+	function sanitizeModeSpec(spec: unknown): ModeSpec {
+		const obj = (spec && typeof spec === "object" ? spec : {}) as Record<string, unknown>;
+		return {
+			provider: typeof obj.provider === "string" ? obj.provider : undefined,
+			modelId: typeof obj.modelId === "string" ? obj.modelId : undefined,
+			thinkingLevel: normalizeThinkingLevel(obj.thinkingLevel),
+		};
+	}
+
+	function loadModesFile(cwd: string): ModesFile | null {
+		const projectPath = getProjectModesPath(cwd);
+		const filePath = existsSync(projectPath) ? projectPath : getGlobalModesPath();
+		if (!existsSync(filePath)) return null;
+
+		try {
+			const parsed = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, unknown>;
+			const rawModes = parsed.modes;
+			if (!rawModes || typeof rawModes !== "object") return null;
+			const modes: Record<string, ModeSpec> = {};
+			for (const [name, spec] of Object.entries(rawModes as Record<string, unknown>)) {
+				modes[name] = sanitizeModeSpec(spec);
+			}
+			return {
+				version: 1,
+				currentMode: typeof parsed.currentMode === "string" ? parsed.currentMode : "",
+				modes,
+			};
+		} catch {
+			return null;
+		}
+	}
+
+	function inferModeNameFromSelection(
+		data: ModesFile,
+		provider: string | undefined,
+		modelId: string | undefined,
+		thinkingLevel: ThinkingLevel | undefined,
+		supportsThinking: boolean,
+	): string | null {
+		if (!provider || !modelId) return null;
+		const names = Object.keys(data.modes).filter((name) => name !== CUSTOM_MODE_NAME);
+		if (supportsThinking) {
+			for (const name of names) {
+				const spec = data.modes[name];
+				if (!spec) continue;
+				if (spec.provider !== provider || spec.modelId !== modelId) continue;
+				if ((spec.thinkingLevel ?? undefined) !== thinkingLevel) continue;
+				return name;
+			}
+			return null;
+		}
+
+		const candidates: string[] = [];
+		for (const name of names) {
+			const spec = data.modes[name];
+			if (!spec) continue;
+			if (spec.provider !== provider || spec.modelId !== modelId) continue;
+			candidates.push(name);
+		}
+		if (candidates.length === 0) return null;
+
+		for (const name of candidates) {
+			const spec = data.modes[name];
+			if (!spec) continue;
+			if ((spec.thinkingLevel ?? "off") === thinkingLevel) return name;
+		}
+
+		for (const name of candidates) {
+			const spec = data.modes[name];
+			if (!spec) continue;
+			if (!spec.thinkingLevel) return name;
+		}
+
+		return candidates[0] ?? null;
 	}
 
 	async function ensureFinder(cwd: string): Promise<FileFinder> {
@@ -286,18 +418,29 @@ export default function fffExtension(pi: ExtensionAPI) {
 		}));
 	}
 
-	let warnedAboutEditorConflict = false;
+	let currentModeLabel = "";
 
-	function hasKnownEditorConflict(): boolean {
-		return (
-			existsSync(join(getAgentDir(), "extensions", "modes.ts")) ||
-			existsSync(join(getAgentDir(), "extensions", "modes", "index.ts")) ||
-			existsSync(join(activeCwd, ".pi", "extensions", "modes.ts")) ||
-			existsSync(join(activeCwd, ".pi", "extensions", "modes", "index.ts"))
-		);
+	function computeModeLabel(ctx: any): string {
+		const modesFile = loadModesFile(activeCwd);
+		if (!modesFile || !modesFile.modes || Object.keys(modesFile.modes).length === 0) return "";
+
+		const provider = ctx.model?.provider as string | undefined;
+		const modelId = ctx.model?.id as string | undefined;
+		const thinkingLevel = pi.getThinkingLevel() as ThinkingLevel | undefined;
+		const supportsThinking = Boolean(ctx.model?.reasoning);
+
+		const inferred = inferModeNameFromSelection(modesFile, provider, modelId, thinkingLevel, supportsThinking);
+		if (inferred) return inferred;
+		if (modesFile.currentMode && modesFile.currentMode in modesFile.modes) return modesFile.currentMode;
+		// Active model is not represented in modes.json -> surface as custom.
+		return CUSTOM_MODE_NAME;
 	}
 
-	function applyEditorMode(ctx: { ui: { setEditorComponent: (factory: any) => void; notify?: (message: string, level: string) => void } }) {
+	function refreshModeLabel(ctx: any): void {
+		currentModeLabel = computeModeLabel(ctx);
+	}
+
+	function applyEditorMode(ctx: { ui: { setEditorComponent: (factory: any) => void } }) {
 		const mode = getMode();
 		if (mode === "tools-only") {
 			// Important: do not clear another extension's custom editor.
@@ -305,20 +448,13 @@ export default function fffExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		if (hasKnownEditorConflict()) {
-			if (!warnedAboutEditorConflict) {
-				warnedAboutEditorConflict = true;
-				ctx.ui.notify?.(
-					'FFF editor autocomplete disabled because a modes editor is installed. FFF search tools remain active. Use /fff-mode tools-only to silence this warning.',
-					'info',
-				);
-			}
-			return;
-		}
-
 		ctx.ui.setEditorComponent((tui: any, theme: any, keybindings: any) =>
-			new FffEditor(tui, theme, keybindings, (baseProvider) =>
-				new FffAtMentionProvider(baseProvider, getMentionItems),
+			new FffEditor(
+				tui,
+				theme,
+				keybindings,
+				(baseProvider) => new FffAtMentionProvider(baseProvider, getMentionItems),
+				() => currentModeLabel,
 			),
 		);
 	}
@@ -334,11 +470,21 @@ export default function fffExtension(pi: ExtensionAPI) {
 		try {
 			activeCwd = ctx.cwd;
 			await ensureFinder(activeCwd);
+			refreshModeLabel(ctx);
 			applyEditorMode(ctx);
 		} catch (e: unknown) {
 			const msg = e instanceof Error ? e.message : String(e);
 			ctx.ui.notify(`FFF init failed: ${msg}`, "error");
 		}
+	});
+
+	pi.on("model_select", async (_event, ctx) => {
+		refreshModeLabel(ctx);
+	});
+
+	pi.on("before_agent_start", async (_event, ctx) => {
+		activeCwd = ctx.cwd;
+		refreshModeLabel(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
