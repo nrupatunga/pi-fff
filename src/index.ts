@@ -223,7 +223,8 @@ class FffEditor extends CustomEditor {
 		if (remaining < 0) return lines;
 
 		const right = "─".repeat(Math.max(0, remaining));
-		lines[0] = this.borderColor(prefix) + this.borderColor(labelChunk) + this.borderColor(right);
+		const gray = (text: string) => `\x1b[90m${text}\x1b[39m`;
+		lines[0] = gray(prefix + labelChunk + right);
 		return lines;
 	}
 }
