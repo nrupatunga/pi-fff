@@ -224,7 +224,7 @@ class FffEditor extends CustomEditor {
 
 		const right = "─".repeat(Math.max(0, remaining));
 		const gray = (text: string) => `\x1b[90m${text}\x1b[39m`;
-		lines[0] = gray(prefix + labelChunk + right);
+		lines[0] = gray(prefix) + this.borderColor(labelChunk) + gray(right);
 		return lines;
 	}
 }
