@@ -431,9 +431,11 @@ export default function fffExtension(pi: ExtensionAPI) {
 
 		const inferred = inferModeNameFromSelection(modesFile, provider, modelId, thinkingLevel, supportsThinking);
 		if (inferred) return inferred;
+		// If there is an active model but it does not match any configured mode,
+		// show it as custom instead of falling back to the saved currentMode.
+		if (provider || modelId) return CUSTOM_MODE_NAME;
 		if (modesFile.currentMode && modesFile.currentMode in modesFile.modes) return modesFile.currentMode;
-		// Active model is not represented in modes.json -> surface as custom.
-		return CUSTOM_MODE_NAME;
+		return "";
 	}
 
 	function refreshModeLabel(ctx: any): void {
